@@ -157,24 +157,28 @@ export class WebSocketRelayTransport implements SignalingTransport {
     // Only relay string payloads; ignore binary / control frames.
     if (typeof event.data !== 'string') return;
 
-    // PieSocket may send system messages as JSON with a "type" field.
-    // Ignore known system events so only opaque signaling payloads reach
-    // the higher layer.
-    try {
-      const parsed = JSON.parse(event.data);
-      if (
-        parsed &&
-        typeof parsed === 'object' &&
-        typeof parsed.type === 'string' &&
-        ['system', 'ping', 'pong'].includes(parsed.type)
-      ) {
-        return;
+    const raw = event.data.trim();
+    if (raw.length === 0) return;
+
+    // PieSocket (Pusher-compatible) sends system messages as JSON objects.
+    // Our signaling payloads are always base64url ciphertext which never
+    // starts with '{'. Use this as a fast-path to distinguish the two.
+    if (raw.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          // Filter PieSocket system events (event field, e.g. "pusher:connection_established")
+          if (typeof parsed.event === 'string') return;
+          // Filter generic system messages (type field, e.g. "system", "ping")
+          if (typeof parsed.type === 'string' &&
+            ['system', 'ping', 'pong'].includes(parsed.type)) return;
+        }
+      } catch {
+        // Not valid JSON despite starting with '{' -- fall through
       }
-    } catch {
-      // Not JSON -- that's fine, treat as opaque payload.
     }
 
-    this.messageHandlers.forEach((h) => h(event.data));
+    this.messageHandlers.forEach((h) => h(raw));
   };
 
   private handleError = (event: Event): void => {
