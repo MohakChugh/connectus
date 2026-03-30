@@ -110,12 +110,47 @@ export class EncryptedSignaling {
   // Public API
   // -----------------------------------------------------------------------
 
-  /** Open the underlying transport connection for this room. */
+  /**
+   * Open the underlying transport connection for this room.
+   * Resolves once the transport is actually connected and ready to send.
+   */
   async connect(): Promise<void> {
     if (this.disposed) {
       throw new Error('EncryptedSignaling: instance has been disposed');
     }
-    this.transport.connect(this.roomId);
+
+    // If already connected, resolve immediately
+    if (this.transport.connected) {
+      return;
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const onOpen = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+
+      const onError = (err: Event | Error) => {
+        if (!settled) {
+          settled = true;
+          reject(
+            err instanceof Error
+              ? err
+              : new Error('Transport failed to connect'),
+          );
+        }
+      };
+
+      // Register one-shot listeners for the connection attempt
+      this.transport.onOpen(onOpen);
+      this.transport.onError(onError);
+
+      this.transport.connect(this.roomId);
+    });
   }
 
   /**
