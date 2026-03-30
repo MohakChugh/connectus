@@ -163,9 +163,9 @@ export class EncryptedSignaling {
     if (this.disposed) {
       throw new Error('EncryptedSignaling: instance has been disposed');
     }
-    if (!this.transport.connected) {
-      throw new Error('EncryptedSignaling: transport not connected');
-    }
+    // Transport may be briefly disconnected during reconnect.
+    // The transport queues messages internally and flushes on reconnect,
+    // so we allow send() to proceed regardless of connection state.
 
     const message: SignalingMessage = {
       version: 1,

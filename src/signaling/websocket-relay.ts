@@ -5,15 +5,13 @@
  * The relay is UNTRUSTED -- all payloads are opaque encrypted strings.
  *
  * Default relay: PieSocket free-tier demo endpoint.
- * Users can supply their own relay URL(s) via the constructor.
- *
- * Relay URL template:  Use `{channel}` as a placeholder that will be
- * replaced with the room/channel identifier at connect time.
  *
  * Features:
  *  - Multiple relay URLs tried in order (first successful wins)
- *  - Automatic reconnection with exponential back-off (max 3 attempts)
- *  - Heart-beat ping to detect stale connections
+ *  - Automatic reconnection with exponential back-off (max 5 attempts)
+ *  - Message queue: messages sent while disconnected are buffered and
+ *    flushed automatically on reconnect
+ *  - Graceful handling of relay system messages
  */
 
 import type {
@@ -31,9 +29,16 @@ const DEFAULT_RELAY_URLS: readonly string[] = [
   'wss://free.blr2.piesocket.com/v3/{channel}?api_key=VCXCEuvhGcBDP7XhiJJUDvR1e1D3eiVjgZ9VRiaV&notify_self=0',
 ];
 
-const MAX_RECONNECT_ATTEMPTS = 3;
+const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 1_000;
-const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/**
+ * Sanitise a room ID into a channel name safe for WebSocket relays.
+ * Strips everything except alphanumerics so UUIDs become pure hex-like strings.
+ */
+function sanitiseChannel(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9]/g, '');
+}
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -53,8 +58,10 @@ export class WebSocketRelayTransport implements SignalingTransport {
   private _connected = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private intentionalDisconnect = false;
+
+  /** Messages queued while the transport was disconnected. */
+  private sendQueue: string[] = [];
 
   constructor(relayUrls?: string[]) {
     this.relayUrls =
@@ -74,19 +81,22 @@ export class WebSocketRelayTransport implements SignalingTransport {
       this.disconnect();
     }
 
-    this.channel = channel;
+    this.channel = sanitiseChannel(channel);
     this.intentionalDisconnect = false;
     this.reconnectAttempts = 0;
     this.currentRelayIndex = 0;
+    this.sendQueue = [];
 
     this.tryConnect();
   }
 
   send(data: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('SignalingTransport: not connected');
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+    } else {
+      // Buffer the message so it can be sent once the connection is (re)established
+      this.sendQueue.push(data);
     }
-    this.ws.send(data);
   }
 
   onMessage(handler: MessageHandler): void {
@@ -107,6 +117,7 @@ export class WebSocketRelayTransport implements SignalingTransport {
 
   disconnect(): void {
     this.intentionalDisconnect = true;
+    this.sendQueue = [];
     this.cleanup();
   }
 
@@ -116,7 +127,6 @@ export class WebSocketRelayTransport implements SignalingTransport {
 
   private tryConnect(): void {
     if (this.currentRelayIndex >= this.relayUrls.length) {
-      // All relays exhausted for this attempt round.
       if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         this.scheduleReconnect();
       } else {
@@ -129,12 +139,11 @@ export class WebSocketRelayTransport implements SignalingTransport {
     }
 
     const urlTemplate = this.relayUrls[this.currentRelayIndex];
-    const url = urlTemplate.replace('{channel}', encodeURIComponent(this.channel!));
+    const url = urlTemplate.replace('{channel}', this.channel!);
 
     try {
       this.ws = new WebSocket(url);
-    } catch (e) {
-      // Synchronous failure (e.g. bad URL).
+    } catch {
       this.currentRelayIndex++;
       this.tryConnect();
       return;
@@ -149,33 +158,39 @@ export class WebSocketRelayTransport implements SignalingTransport {
   private handleOpen = (): void => {
     this._connected = true;
     this.reconnectAttempts = 0;
-    this.startHeartbeat();
     this.openHandlers.forEach((h) => h());
+    this.flushQueue();
   };
 
+  /**
+   * Flush any messages that were queued while disconnected.
+   */
+  private flushQueue(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const pending = this.sendQueue.splice(0);
+    for (const msg of pending) {
+      try {
+        this.ws.send(msg);
+      } catch {
+        // Re-queue on failure -- next reconnect will retry
+        this.sendQueue.push(msg);
+        break;
+      }
+    }
+  }
+
   private handleMessage = (event: MessageEvent): void => {
-    // Only relay string payloads; ignore binary / control frames.
     if (typeof event.data !== 'string') return;
 
     const raw = event.data.trim();
     if (raw.length === 0) return;
 
-    // PieSocket (Pusher-compatible) sends system messages as JSON objects.
-    // Our signaling payloads are always base64url ciphertext which never
-    // starts with '{'. Use this as a fast-path to distinguish the two.
-    if (raw.startsWith('{')) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          // Filter PieSocket system events (event field, e.g. "pusher:connection_established")
-          if (typeof parsed.event === 'string') return;
-          // Filter generic system messages (type field, e.g. "system", "ping")
-          if (typeof parsed.type === 'string' &&
-            ['system', 'ping', 'pong'].includes(parsed.type)) return;
-        }
-      } catch {
-        // Not valid JSON despite starting with '{' -- fall through
-      }
+    // ---- Filter out relay system / control messages ----
+    // Our encrypted signaling payloads are base64url which only contains
+    // [A-Za-z0-9_-]. They NEVER start with '{' or '['.
+    // Any JSON object/array is therefore a relay system message.
+    if (raw.startsWith('{') || raw.startsWith('[')) {
+      return;
     }
 
     this.messageHandlers.forEach((h) => h(raw));
@@ -188,7 +203,6 @@ export class WebSocketRelayTransport implements SignalingTransport {
   private handleClose = (): void => {
     const wasConnected = this._connected;
     this._connected = false;
-    this.stopHeartbeat();
 
     if (this.intentionalDisconnect) {
       this.closeHandlers.forEach((h) => h());
@@ -196,13 +210,17 @@ export class WebSocketRelayTransport implements SignalingTransport {
     }
 
     if (wasConnected) {
-      // Was previously connected -- attempt reconnect from the same relay.
-      this.closeHandlers.forEach((h) => h());
+      // Was previously connected -- attempt silent reconnect.
+      // Do NOT notify close handlers during transient reconnects so the UI
+      // doesn't flap between connected/disconnected.
       if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         this.scheduleReconnect();
+      } else {
+        // Exhausted retries -- now notify
+        this.closeHandlers.forEach((h) => h());
       }
     } else {
-      // Never connected -- try the next relay URL.
+      // Never connected with this relay -- try next URL.
       this.currentRelayIndex++;
       this.tryConnect();
     }
@@ -223,37 +241,13 @@ export class WebSocketRelayTransport implements SignalingTransport {
     }, delay);
   }
 
-  private startHeartbeat(): void {
-    this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        // Send a lightweight ping frame the relay can ignore.
-        try {
-          this.ws.send('');
-        } catch {
-          // Ignore -- close handler will deal with broken connections.
-        }
-      }
-    }, HEARTBEAT_INTERVAL_MS);
-  }
-
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer !== null) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-  }
-
   private cleanup(): void {
-    this.stopHeartbeat();
-
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
 
     if (this.ws) {
-      // Remove handlers to avoid firing callbacks during teardown.
       this.ws.onopen = null;
       this.ws.onmessage = null;
       this.ws.onerror = null;

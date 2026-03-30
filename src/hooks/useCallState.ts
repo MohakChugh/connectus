@@ -107,10 +107,13 @@ const INITIAL_STATE: CallStateData = {
 // ---------------------------------------------------------------------------
 
 function determineE2eeStatus(connected: boolean): E2eeStatus {
-  if (PeerConnection.supportsInsertableStreams()) {
-    return connected ? 'active' : 'unavailable';
+  const supported = PeerConnection.supportsInsertableStreams();
+  if (connected) {
+    return supported ? 'active' : 'fallback';
   }
-  return connected ? 'fallback' : 'unavailable';
+  // Before WebRTC connects, reflect browser capability so the UI can
+  // show "E2EE supported" / "E2EE not available" in the waiting room.
+  return supported ? 'active' : 'fallback';
 }
 
 // ---------------------------------------------------------------------------
