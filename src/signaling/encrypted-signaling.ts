@@ -220,8 +220,14 @@ export class EncryptedSignaling {
     }
 
     // 4. Replay protection ------------------------------------------------
-    if (!this.replayProtector.accept(message.messageId)) {
-      this.onErrorCb('Rejected replayed signaling message');
+    const replayResult = this.replayProtector.check(
+      message.messageId,
+      message.timestamp,
+      message.roomId,
+      this.roomId,
+    );
+    if (!replayResult.valid) {
+      this.onErrorCb(`Rejected signaling message: ${replayResult.reason}`);
       return;
     }
 

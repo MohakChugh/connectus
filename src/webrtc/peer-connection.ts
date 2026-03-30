@@ -29,7 +29,7 @@ export class PeerConnection {
 
     const rtcConfig: RTCConfiguration = {
       iceServers: ICE_SERVERS,
-      // @ts-expect-error - encodedInsertableStreams is a non-standard Chrome property
+      // @ts-ignore - encodedInsertableStreams is a non-standard Chrome property
       encodedInsertableStreams: this.shouldUseInsertableStreams(),
     };
 
@@ -199,7 +199,7 @@ export class PeerConnection {
     }
 
     try {
-      // @ts-expect-error - RTCRtpScriptTransform is not yet in TypeScript lib
+      // @ts-ignore - RTCRtpScriptTransform may not be in TypeScript lib
       sender.transform = new RTCRtpScriptTransform(this.encryptWorker, { mode: 'encrypt' });
     } catch {
       if (this.config.e2eeMode === 'strict') {
@@ -214,7 +214,7 @@ export class PeerConnection {
     }
 
     try {
-      // @ts-expect-error - RTCRtpScriptTransform is not yet in TypeScript lib
+      // @ts-ignore - RTCRtpScriptTransform may not be in TypeScript lib
       receiver.transform = new RTCRtpScriptTransform(this.decryptWorker, { mode: 'decrypt' });
     } catch {
       if (this.config.e2eeMode === 'strict') {

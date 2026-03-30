@@ -50,7 +50,7 @@ async function encryptFrame(
     const plaintext = frame.data;
 
     const ciphertext = await self.crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
+      { name: 'AES-GCM', iv: iv as BufferSource },
       encryptKey,
       plaintext,
     );
@@ -96,7 +96,7 @@ async function decryptFrame(
 
   try {
     const plaintext = await self.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv },
+      { name: 'AES-GCM', iv: iv as BufferSource },
       decryptKey,
       ciphertext,
     );
@@ -124,7 +124,7 @@ self.onmessage = (event: MessageEvent) => {
 };
 
 // RTCRtpScriptTransform handler
-// @ts-expect-error - onrtctransform is not yet in TypeScript lib definitions
+// @ts-ignore - onrtctransform is not yet in TypeScript lib definitions
 self.onrtctransform = (event: { transformer: { readable: ReadableStream; writable: WritableStream; options?: { mode?: string } } }) => {
   const { readable, writable, options } = event.transformer;
   const mode = options?.mode;
