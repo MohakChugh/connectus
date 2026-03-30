@@ -1,17 +1,23 @@
 /**
- * WebSocketRelayTransport - Signaling transport over a WebSocket relay.
+ * NtfySignalingTransport - Signaling transport over ntfy.sh pub/sub.
  *
- * Connects to a public (or self-hosted) WebSocket relay service.
+ * ntfy.sh is a free, open-source push notification service that supports
+ * WebSocket subscriptions and HTTP POST publishing. It requires no API keys
+ * or authentication.
+ *
+ * How it works:
+ *  - Each room gets a unique topic: "connectus_{sanitised-room-id}"
+ *  - Both clients subscribe to the topic via WebSocket
+ *  - Messages are published via HTTP POST (fetch) to the same topic
+ *  - ntfy.sh broadcasts each POST to all WebSocket subscribers on that topic
+ *
  * The relay is UNTRUSTED -- all payloads are opaque encrypted strings.
  *
- * Default relay: PieSocket free-tier demo endpoint.
- *
  * Features:
- *  - Multiple relay URLs tried in order (first successful wins)
  *  - Automatic reconnection with exponential back-off (max 5 attempts)
  *  - Message queue: messages sent while disconnected are buffered and
  *    flushed automatically on reconnect
- *  - Graceful handling of relay system messages
+ *  - System messages from ntfy.sh (open, keepalive) are filtered out
  */
 
 import type {
@@ -25,19 +31,18 @@ import type {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_RELAY_URLS: readonly string[] = [
-  'wss://free.blr2.piesocket.com/v3/{channel}?api_key=VCXCEuvhGcBDP7XhiJJUDvR1e1D3eiVjgZ9VRiaV&notify_self=0',
-];
+const NTFY_BASE = 'ntfy.sh';
+const TOPIC_PREFIX = 'connectus_';
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 
 /**
- * Sanitise a room ID into a channel name safe for WebSocket relays.
- * Strips everything except alphanumerics so UUIDs become pure hex-like strings.
+ * Sanitise a room ID into a topic name safe for ntfy.sh.
+ * Topics must be alphanumeric (plus underscores/hyphens).
  */
-function sanitiseChannel(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9]/g, '');
+function buildTopic(roomId: string): string {
+  return TOPIC_PREFIX + roomId.replace(/[^a-zA-Z0-9]/g, '');
 }
 
 // ---------------------------------------------------------------------------
@@ -46,9 +51,7 @@ function sanitiseChannel(raw: string): string {
 
 export class WebSocketRelayTransport implements SignalingTransport {
   private ws: WebSocket | null = null;
-  private channel: string | null = null;
-  private relayUrls: readonly string[];
-  private currentRelayIndex = 0;
+  private topic: string | null = null;
 
   private messageHandlers: MessageHandler[] = [];
   private openHandlers: ConnectionHandler[] = [];
@@ -63,11 +66,6 @@ export class WebSocketRelayTransport implements SignalingTransport {
   /** Messages queued while the transport was disconnected. */
   private sendQueue: string[] = [];
 
-  constructor(relayUrls?: string[]) {
-    this.relayUrls =
-      relayUrls && relayUrls.length > 0 ? relayUrls : DEFAULT_RELAY_URLS;
-  }
-
   // -----------------------------------------------------------------------
   // Public API
   // -----------------------------------------------------------------------
@@ -81,20 +79,22 @@ export class WebSocketRelayTransport implements SignalingTransport {
       this.disconnect();
     }
 
-    this.channel = sanitiseChannel(channel);
+    this.topic = buildTopic(channel);
     this.intentionalDisconnect = false;
     this.reconnectAttempts = 0;
-    this.currentRelayIndex = 0;
     this.sendQueue = [];
 
     this.tryConnect();
   }
 
+  /**
+   * Publish a message to the topic via HTTP POST.
+   * If the transport is disconnected, the message is queued.
+   */
   send(data: string): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(data);
+    if (this._connected && this.topic) {
+      this.publishMessage(data);
     } else {
-      // Buffer the message so it can be sent once the connection is (re)established
       this.sendQueue.push(data);
     }
   }
@@ -122,30 +122,18 @@ export class WebSocketRelayTransport implements SignalingTransport {
   }
 
   // -----------------------------------------------------------------------
-  // Internal
+  // Internal -- connection
   // -----------------------------------------------------------------------
 
   private tryConnect(): void {
-    if (this.currentRelayIndex >= this.relayUrls.length) {
-      if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        this.scheduleReconnect();
-      } else {
-        const err = new Error(
-          'SignalingTransport: all relay URLs exhausted after max retries',
-        );
-        this.errorHandlers.forEach((h) => h(err));
-      }
-      return;
-    }
+    if (!this.topic) return;
 
-    const urlTemplate = this.relayUrls[this.currentRelayIndex];
-    const url = urlTemplate.replace('{channel}', this.channel!);
+    const url = `wss://${NTFY_BASE}/${this.topic}/ws`;
 
     try {
       this.ws = new WebSocket(url);
     } catch {
-      this.currentRelayIndex++;
-      this.tryConnect();
+      this.scheduleReconnect();
       return;
     }
 
@@ -162,37 +150,32 @@ export class WebSocketRelayTransport implements SignalingTransport {
     this.flushQueue();
   };
 
-  /**
-   * Flush any messages that were queued while disconnected.
-   */
-  private flushQueue(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const pending = this.sendQueue.splice(0);
-    for (const msg of pending) {
-      try {
-        this.ws.send(msg);
-      } catch {
-        // Re-queue on failure -- next reconnect will retry
-        this.sendQueue.push(msg);
-        break;
-      }
-    }
-  }
-
   private handleMessage = (event: MessageEvent): void => {
     if (typeof event.data !== 'string') return;
 
     const raw = event.data.trim();
     if (raw.length === 0) return;
 
-    // ---- Filter out relay system / control messages ----
-    // Our encrypted signaling payloads are base64url which only contains
-    // [A-Za-z0-9_-]. They NEVER start with '{' or '['.
-    // Any JSON object/array is therefore a relay system message.
-    if (raw.startsWith('{') || raw.startsWith('[')) {
-      return;
+    // ntfy.sh sends JSON-wrapped events. Extract the message payload
+    // from "message" events and drop system events (open, keepalive).
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        // Only relay actual message events
+        if (parsed.event === 'message' && typeof parsed.message === 'string') {
+          const payload = parsed.message.trim();
+          if (payload.length > 0) {
+            this.messageHandlers.forEach((h) => h(payload));
+          }
+        }
+        // All other events (open, keepalive, etc.) are silently dropped
+        return;
+      }
+    } catch {
+      // Not JSON -- pass through as raw (shouldn't happen with ntfy.sh)
     }
 
+    // Fallback: forward non-JSON messages directly
     this.messageHandlers.forEach((h) => h(raw));
   };
 
@@ -210,25 +193,61 @@ export class WebSocketRelayTransport implements SignalingTransport {
     }
 
     if (wasConnected) {
-      // Was previously connected -- attempt silent reconnect.
-      // Do NOT notify close handlers during transient reconnects so the UI
-      // doesn't flap between connected/disconnected.
+      // Transient disconnect -- attempt silent reconnect without
+      // notifying close handlers to prevent UI flapping.
       if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         this.scheduleReconnect();
       } else {
-        // Exhausted retries -- now notify
         this.closeHandlers.forEach((h) => h());
       }
     } else {
-      // Never connected with this relay -- try next URL.
-      this.currentRelayIndex++;
-      this.tryConnect();
+      // Never connected -- retry
+      this.scheduleReconnect();
     }
   };
 
+  // -----------------------------------------------------------------------
+  // Internal -- publishing
+  // -----------------------------------------------------------------------
+
+  private async publishMessage(data: string): Promise<void> {
+    if (!this.topic) return;
+
+    try {
+      await fetch(`https://${NTFY_BASE}/${this.topic}`, {
+        method: 'POST',
+        body: data,
+        headers: {
+          // Disable ntfy.sh caching/Firebase delivery -- we only need WebSocket
+          'Cache': 'no',
+          'X-Priority': '5',
+        },
+      });
+    } catch {
+      // If publish fails, queue for retry
+      this.sendQueue.push(data);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Internal -- queue & reconnect
+  // -----------------------------------------------------------------------
+
+  private flushQueue(): void {
+    const pending = this.sendQueue.splice(0);
+    for (const msg of pending) {
+      this.publishMessage(msg);
+    }
+  }
+
   private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      const err = new Error('SignalingTransport: relay exhausted after max retries');
+      this.errorHandlers.forEach((h) => h(err));
+      return;
+    }
+
     this.reconnectAttempts++;
-    this.currentRelayIndex = 0;
 
     const delay =
       BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1);
